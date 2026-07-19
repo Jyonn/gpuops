@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional
 
 from .actions import filter_processes, kill_processes, signal_for
 from .alerts import evaluate_snapshot
-from .formatting import gpu_rows, json_dump, process_rows, table
+from .formatting import json_dump
 from .history import DEFAULT_HISTORY_PATH, read_snapshots, record_snapshot, since_days, summarize_user_usage
+from .models import Snapshot
 from .nvidia import NvidiaSmiError, collect_snapshot
 from .process_info import enrich_processes
-from .models import Snapshot
+from .ui import (
+    confirm,
+    loading,
+    print_alerts,
+    print_empty,
+    print_error,
+    print_gpu_status,
+    print_history,
+    print_kill_results,
+    print_processes,
+    print_users,
+    progress,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     kill.add_argument("--user")
     kill.add_argument("--force", action="store_true", help="use SIGKILL instead of SIGTERM")
     kill.add_argument("--yes", action="store_true", help="actually send the signal")
+    kill.add_argument("--interactive", "-i", action="store_true", help="preview and ask before sending signals")
 
     history = subparsers.add_parser("history", help="summarize recorded GPU usage")
     history.add_argument("--json", action="store_true", help="print machine-readable JSON")
@@ -59,9 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _snapshot() -> Snapshot:
-    snap = collect_snapshot()
-    enrich_processes(snap.processes)
+def _snapshot(show_loading: bool = True) -> Snapshot:
+    with loading("Collecting GPU telemetry", enabled=show_loading):
+        snap = collect_snapshot()
+        enrich_processes(snap.processes)
     return snap
 
 
@@ -78,31 +92,35 @@ def _sort_gpus(gpus, key: str):
 
 
 def cmd_status(args) -> int:
-    snap = _snapshot()
+    snap = _snapshot(show_loading=not args.json)
     if args.record:
-        record_snapshot(snap)
+        with loading("Recording history sample", enabled=not args.json):
+            record_snapshot(snap)
     alerts = evaluate_snapshot(snap)
     gpus = _sort_gpus(snap.gpus, args.sort)
     if args.json:
         print(json_dump({"snapshot": snap.to_dict(), "alerts": [alert.__dict__ for alert in alerts]}))
         return 0
-    print(table(["GPU", "Name", "Memory", "Free", "Util", "Temp", "Power", "Alerts"], gpu_rows(gpus, alerts)))
+    print_gpu_status(gpus, alerts)
     return 0
 
 
 def cmd_ps(args) -> int:
-    snap = _snapshot()
+    snap = _snapshot(show_loading=not args.json)
     processes = filter_processes(snap.processes, gpu=args.gpu, user=args.user)
     processes.sort(key=lambda proc: (proc.gpu_index if proc.gpu_index is not None else 9999, -proc.used_memory_mb))
     if args.json:
         print(json_dump([proc.__dict__ for proc in processes]))
         return 0
-    print(table(["GPU", "PID", "User", "Memory", "Running", "Command", "CWD"], process_rows(processes)))
+    if not processes:
+        print_empty("No matching GPU processes.")
+        return 0
+    print_processes(processes)
     return 0
 
 
 def cmd_users(args) -> int:
-    snap = _snapshot()
+    snap = _snapshot(show_loading=not args.json)
     buckets = defaultdict(lambda: {"memory": 0, "processes": 0, "runtime": 0.0, "gpus": set()})
     for proc in snap.processes:
         user = proc.user or "unknown"
@@ -131,22 +149,15 @@ def cmd_users(args) -> int:
     if args.json:
         print(json_dump(summaries))
         return 0
-    rows = [
-        [item["user"], item["gpus"], item["processes"], f"{item['memory_mb']} MB", _duration(item["runtime_seconds"])]
-        for item in summaries
-    ]
-    print(table(["User", "GPUs", "Processes", "Memory", "Total Running"], rows))
+    if not summaries:
+        print_empty("No active GPU users.")
+        return 0
+    print_users(summaries)
     return 0
 
 
-def _duration(seconds: float) -> str:
-    from .formatting import human_duration
-
-    return human_duration(seconds)
-
-
 def cmd_top(args) -> int:
-    snap = _snapshot()
+    snap = _snapshot(show_loading=not args.json)
     if args.by == "runtime":
         processes = sorted(snap.processes, key=lambda proc: proc.running_seconds or 0, reverse=True)
     else:
@@ -155,56 +166,69 @@ def cmd_top(args) -> int:
     if args.json:
         print(json_dump([proc.__dict__ for proc in processes]))
         return 0
-    print(table(["GPU", "PID", "User", "Memory", "Running", "Command", "CWD"], process_rows(processes)))
+    if not processes:
+        print_empty("No GPU processes to rank.")
+        return 0
+    print_processes(processes, title=f"GPU Process Top by {args.by.title()}")
     return 0
 
 
 def cmd_doctor(args) -> int:
-    snap = _snapshot()
+    snap = _snapshot(show_loading=not args.json)
     alerts = evaluate_snapshot(snap, idle_util_percent=args.idle_util, occupied_memory_mb=args.occupied_mb)
     if args.json:
         print(json_dump([alert.__dict__ for alert in alerts]))
         return 0
-    if not alerts:
-        print("No suspicious GPU state found.")
-        return 0
-    rows = [[alert.level, alert.gpu_index, alert.message] for alert in alerts]
-    print(table(["Level", "GPU", "Message"], rows))
+    print_alerts(alerts)
     return 1 if any(alert.level == "crit" for alert in alerts) else 0
 
 
 def cmd_kill(args) -> int:
     if args.gpu is None and args.user is None:
-        print("Refusing to select every GPU process. Pass --gpu, --user, or both.", file=sys.stderr)
+        print_error("Refusing to select every GPU process. Pass --gpu, --user, or both.")
         return 2
-    snap = _snapshot()
+    snap = _snapshot(show_loading=not args.json)
     selected = filter_processes(snap.processes, gpu=args.gpu, user=args.user)
     sig = signal_for(args.force)
-    results = kill_processes(selected, sig=sig, dry_run=not args.yes)
-    rows = [[r.gpu_index if r.gpu_index is not None else "-", r.pid, r.user or "-", r.signal_name, r.message] for r in results]
+    dry_run = not args.yes
+    if args.interactive and selected and not args.yes and not args.json:
+        preview = kill_processes(selected, sig=sig, dry_run=True)
+        print_kill_results(preview)
+        dry_run = not confirm(f"Send {sig.name} to {len(selected)} selected process(es)?", default=False)
+
+    results = []
+    if selected and not dry_run and not args.json:
+        with progress("Sending signals", total=len(selected)) as bar:
+            task_id = bar.add_task("Sending signals", total=len(selected))
+            for proc in selected:
+                results.extend(kill_processes([proc], sig=sig, dry_run=False))
+                bar.advance(task_id)
+    else:
+        results = kill_processes(selected, sig=sig, dry_run=dry_run)
     if args.json:
         print(json_dump([result.__dict__ for result in results]))
         return 0
-    if not rows:
-        print("No matching GPU processes.")
+    if not results:
+        print_empty("No matching GPU processes.")
         return 0
-    print(table(["GPU", "PID", "User", "Signal", "Result"], rows))
-    if not args.yes:
-        print("\nDry-run only. Re-run with --yes to send the signal.")
+    print_kill_results(results)
+    if dry_run:
+        print_empty("Dry-run only. Re-run with --yes, or use --interactive to confirm in-place.")
     return 0
 
 
 def cmd_history(args) -> int:
-    samples = read_snapshots(path=Path(args.path).expanduser(), since=since_days(args.days))
-    usage = summarize_user_usage(samples)
+    with loading("Reading usage history", enabled=not args.json):
+        samples = read_snapshots(path=Path(args.path).expanduser(), since=since_days(args.days))
+    with loading("Summarizing GPU hours", enabled=not args.json):
+        usage = summarize_user_usage(samples)
     if args.json:
         print(json_dump([item.__dict__ for item in usage]))
         return 0
     if not usage:
-        print("No history samples found. Run `gpuops status --record` periodically first.")
+        print_empty("No history samples found. Run `gpuops status --record` periodically first.")
         return 0
-    rows = [[item.user, f"{item.gpu_hours:.2f}", f"{item.memory_gb_hours:.2f}", item.samples] for item in usage]
-    print(table(["User", "GPU Hours", "GB Hours", "Samples"], rows))
+    print_history(usage, args.days)
     return 0
 
 
@@ -222,5 +246,5 @@ def main(argv: Optional[List[str]] = None) -> int:
             "history": cmd_history,
         }[args.command](args)
     except NvidiaSmiError as exc:
-        print(str(exc), file=sys.stderr)
+        print_error(str(exc))
         return 127

@@ -15,6 +15,8 @@ history.
 - Per-user summary across all GPUs.
 - Memory/running-time top view.
 - Lightweight JSONL history sampling and GPU-hour aggregation.
+- Rich terminal output: loading spinners, colored tables, memory bars, and progress bars.
+- Interactive kill confirmation with `gpuops kill --interactive`.
 - Safe-by-default process management: `kill` is dry-run unless `--yes` is passed.
 
 ## Install locally
@@ -43,12 +45,21 @@ gpuops kill --user alice
 gpuops kill --gpu 3 --user alice
 ```
 
+Preview and confirm in-place:
+
+```bash
+gpuops kill --gpu 3 --user alice --interactive
+```
+
 To actually send signals:
 
 ```bash
 gpuops kill --gpu 3 --user alice --yes
 gpuops kill --user alice --force --yes
 ```
+
+Use `--json` on any command when piping into scripts; JSON output skips the
+loading spinners, prompts, and table styling.
 
 ## History
 

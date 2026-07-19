@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpuops"
-version = "0.1.0"
+version = "0.1.1"
 description = "A small GPU operations CLI for shared lab servers."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [{ name = "GPUOps contributors" }]
-dependencies = []
+dependencies = ["rich>=13.7"]
 
 [project.scripts]
 gpuops = "gpuops.cli:main"
